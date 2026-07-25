@@ -112,13 +112,19 @@ def set_autostart(enabled: bool):
 
 # ── Hardware Brightness Control ───────────────────────────────────────────────
 def set_hardware_brightness(pct: int):
-    """Set monitor hardware brightness using WMI via PowerShell."""
+    """Set monitor hardware brightness using WMI via PowerShell without popup."""
     pct = max(0, min(100, pct))
     cmd = f"""
         $mon = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods
         Invoke-CimMethod -InputObject $mon -MethodName WmiSetBrightness -Arguments @{{Timeout=1; Brightness={pct}}}
     """
-    subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True)
+    
+    # Tambahkan parameter CREATE_NO_WINDOW untuk mencegah popup CMD
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", cmd], 
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
 
 # ── Overlay Window Management ─────────────────────────────────────────────────
 class OverlayWindow:
