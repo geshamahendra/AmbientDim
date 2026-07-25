@@ -1,3 +1,4 @@
+```markdown
 # AmbientDim — Ambient Light Sensor Screen Dimmer for Windows
 
 **AmbientDim** is a lightweight, open-source Windows utility that dynamically adjusts screen brightness based on your room's ambient light levels using your device's physical Ambient Light Sensor (ALS). 
@@ -32,8 +33,49 @@ Unlike traditional dimmers that rely solely on time schedules or blue-light filt
    ```bash
    pip install pystray pillow winrt-Windows.Devices.Sensors screeninfo pyinstaller
 
+```
+
+3. Run the main script:
+```bash
+python autodimmer.py
+
+```
+
+
+
+---
+
 ### 📦 Compiling to Executable (.exe)
 
 If you want to build the single-file executable yourself using PyInstaller:
+
 ```bash
 pyinstaller --noconsole --onefile --admin autodimmer.py
+
+```
+
+*The compiled `AmbientDim.exe` will be saved in the `dist/` directory.*
+
+---
+
+### ⚙️ How the Calibration Curve Works
+
+The calibration curve maps **Lux (Room Light)** to **Hardware Brightness (%)** and **Dark Overlay (Alpha)**:
+
+| Lux Range | Hardware Brightness | Dark Overlay Alpha | Description |
+| --- | --- | --- | --- |
+| **> 27 Lux** | 1% – 100% | `0.00` (Off) | Standard daytime room lighting (Hardware controlled). |
+| **27 Lux** | 0% (Minimum) | `0.00` (Off) | Hardware baseline limit (Calibration zero-point). |
+| **< 27 Lux** | 0% (Minimum) | `0.01` – `0.75` | Extremely dark / pitch-black room (Software overlay engages). |
+
+*Note: All custom curve configurations are automatically saved to `%APPDATA%\AmbientDim\config.json`.*
+
+---
+
+### 🤝 Related Projects
+
+* **[Dimmr](https://github.com/geshamahendra/Dimmr)** — Time-scheduled screen dimmer overlay for Windows without sensor dependencies.
+
+```
+
+```
