@@ -1,4 +1,3 @@
-```markdown
 # AmbientDim — Ambient Light Sensor Screen Dimmer for Windows
 
 **AmbientDim** is a lightweight, open-source Windows utility that dynamically adjusts screen brightness based on your room's ambient light levels using your device's physical Ambient Light Sensor (ALS). 
@@ -33,22 +32,9 @@ Unlike traditional dimmers that rely solely on time schedules or blue-light filt
    ```bash
    pip install pystray pillow winrt-Windows.Devices.Sensors screeninfo pyinstaller
 
-```
-
-3. Run the main script:
-```bash
-python autodimmer.py
-
-```
-
-
-
----
-
 ### 📦 Compiling to Executable (.exe)
 
 If you want to build the single-file executable yourself using PyInstaller:
-
 ```bash
 pyinstaller --noconsole --onefile --admin autodimmer.py
 
