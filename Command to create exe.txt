@@ -1,1 +1,1 @@
-pyinstaller --onefile --windowed --name "LuxDim" --hidden-import=pystray._win32 --hidden-import=PIL._tkinter_finder luxdim.py
+pyinstaller --onefile --windowed --name "AmbientDim" --hidden-import=pystray._win32 --hidden-import=PIL._tkinter_finder AmbientDim.py

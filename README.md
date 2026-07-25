@@ -1,8 +1,8 @@
-# LuxDim — Ambient Light Sensor Screen Dimmer for Windows
+# AmbientDim — Ambient Light Sensor Screen Dimmer for Windows
 
-**LuxDim** is a lightweight, open-source Windows utility that dynamically adjusts screen brightness based on your room's ambient light levels using your device's physical Ambient Light Sensor (ALS). 
+**AmbientDim** is a lightweight, open-source Windows utility that dynamically adjusts screen brightness based on your room's ambient light levels using your device's physical Ambient Light Sensor (ALS). 
 
-Unlike traditional dimmers that rely solely on time schedules or blue-light filters, LuxDim continuously monitors environment light and combines **hardware monitor brightness (WMI)** with a **software-based dark overlay**. This enables true deep-dimming—reducing screen brightness far beyond Windows' standard 0% limit in pitch-black environments.
+Unlike traditional dimmers that rely solely on time schedules or blue-light filters, AmbientDim continuously monitors environment light and combines **hardware monitor brightness (WMI)** with a **software-based dark overlay**. This enables true deep-dimming—reducing screen brightness far beyond Windows' standard 0% limit in pitch-black environments.
 
 ---
 
@@ -20,8 +20,8 @@ Unlike traditional dimmers that rely solely on time schedules or blue-light filt
 ### 🚀 How to Use
 
 #### Option 1: Pre-compiled Executable (Easiest)
-1. Download `LuxDim.exe` from the latest release or the `dist/` directory.
-2. Run `LuxDim.exe`. It will start minimized in your Windows System Tray (bottom-right corner).
+1. Download `AmbientDim.exe` from the latest release or the `dist/` directory.
+2. Run `AmbientDim.exe`. It will start minimized in your Windows System Tray (bottom-right corner).
 3. Right-click the tray icon and select **⚙ Calibrate ALS Curve...** to tune light levels according to your room environment.
 4. *(Optional)* Check **Run at Windows Startup** directly from the tray menu to launch automatically when you turn on your PC.
 
