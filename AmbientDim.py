@@ -464,8 +464,12 @@ class AutoDimmerApp:
             self.config["alr_curve"] = sorted_curve
             save_config(self.config)
 
+            schedules.clear()
+            schedules.extend([list(pt) for pt in sorted_curve])
+
             self.send_notification("Curve Saved", f"Applied {len(sorted_curve)} calibration points.")
-            win.destroy()
+            
+            render_rows()
 
         # Tombol Aksi Bawah (Font 11)
         btn_frame = tk.Frame(win, bg=bg)
