@@ -1,7 +1,8 @@
 """
 AutoDimmer ALS - Ambient Light Sensor Screen Dimmer for Windows
 Combines Hardware Brightness (PowerShell WMI) and Software Overlay (Tkinter)
-with dynamic ALS Curve Editor and System Tray support.
+with dynamic ALS Curve Editor, Real-Time HW Sync, System Tray support,
+and Auto-Reconnect/Single-Instance protection for login reliability.
 """
 
 import tkinter as tk
@@ -12,16 +13,34 @@ import os
 import sys
 import ctypes
 import math
+import msvcrt
+import time
 from winrt.windows.devices.sensors import LightSensor
 from PIL import Image, ImageDraw
 import pystray
 
+# ── Single Instance Enforcement ───────────────────────────────────────────────
+LOCK_FILE_PATH = os.path.join(os.environ.get("APPDATA", "."), "AutoDimmer", "autodimmer.lock")
+_lock_fd = None
+
+def ensure_single_instance():
+    """Ensure only one instance of AutoDimmer runs, killing/exiting duplicates."""
+    global _lock_fd
+    os.makedirs(os.path.dirname(LOCK_FILE_PATH), exist_ok=True)
+    try:
+        _lock_fd = open(LOCK_FILE_PATH, "w")
+        msvcrt.locking(_lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except (IOError, Exception):
+        print("[Info] AutoDimmer is already running. Exiting duplicate instance.")
+        sys.exit(0)
+
 # ── Windows API Constants ─────────────────────────────────────────────────────
-GWL_EXSTYLE       = -20
-WS_EX_LAYERED     = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW  = 0x00000080
-WS_EX_NOACTIVATE  = 0x08000000
+GWL_EXSTYLE            = -20
+WS_EX_LAYERED          = 0x00080000
+WS_EX_TRANSPARENT      = 0x00000020
+WS_EX_TOOLWINDOW       = 0x00000080
+WS_EX_NOACTIVATE       = 0x08000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 user32 = ctypes.windll.user32
 
@@ -30,13 +49,19 @@ def _hwnd(win):
     return user32.GetParent(win.winfo_id()) or win.winfo_id()
 
 def make_click_through(win):
-    """Make the Tkinter window click-through, layered, and transparent."""
+    """Make the Tkinter window click-through, layered, transparent, and excluded from capture."""
     hwnd  = _hwnd(win)
     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    
     user32.SetWindowLongW(
         hwnd, GWL_EXSTYLE,
         style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
     )
+    
+    try:
+        user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+    except AttributeError:
+        pass
 
 def get_monitors(root):
     """Fetch all monitor bounds. Fallback to primary screen width/height."""
@@ -118,8 +143,6 @@ def set_hardware_brightness(pct: int):
         $mon = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods
         Invoke-CimMethod -InputObject $mon -MethodName WmiSetBrightness -Arguments @{{Timeout=1; Brightness={pct}}}
     """
-    
-    # Tambahkan parameter CREATE_NO_WINDOW untuk mencegah popup CMD
     subprocess.run(
         ["powershell", "-NoProfile", "-Command", cmd], 
         capture_output=True,
@@ -183,11 +206,9 @@ def make_tray_icon(enabled: bool, lux: float = 0.0) -> Image.Image:
     draw = ImageDraw.Draw(img)
     color = "#F5C518" if enabled else "#555555"
     
-    # Base circle
     draw.ellipse([2, 2, size-3, size-3], fill="#222222", outline=color, width=2)
     
     if enabled:
-        # Fill bar proportional to a rough log scale of lux (0–10000)
         safe_lux = max(0.0, lux)
         pct = math.log1p(safe_lux) / math.log1p(10000)
         pct = min(max(pct, 0.0), 1.0)
@@ -196,7 +217,6 @@ def make_tray_icon(enabled: bool, lux: float = 0.0) -> Image.Image:
         if fill_h > 0:
             draw.rectangle([4, size - 4 - fill_h, size - 5, size - 4], fill="#F5C518")
             
-    # Masking for rounded edges
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).ellipse([2, 2, size-3, size-3], fill=255)
     img.putalpha(mask)
@@ -207,34 +227,84 @@ class AutoDimmerApp:
     def __init__(self):
         self.config = load_config()
 
-        # Tkinter Hidden Root Window
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("AutoDimmer ALS")
 
-        # Initialize Managers & Sensors
         self.overlay_mgr = OverlayManager(self.root)
-        self.sensor = LightSensor.get_default()
+        self.overlay_mgr.rebuild()
 
+        self.sensor = LightSensor.get_default()
         if self.sensor is not None:
             self.sensor.report_interval = self.config.get("poll_interval_ms", 2000)
 
         self.last_hw = -1
         self.last_ov = -1.0
         self.current_lux = 0.0
+        
+        self.sensor_was_disconnected = False  # Track reconnection for wake event
+        self.last_successful_reading_time = time.time()  # Detect stale readings (sleep mode)
+        self.last_poll_time = time.time()  # Detect system wake via time jump
+        self.wake_detected = False  # Flag for comprehensive reset on wake
+        self.force_reset_on_enable = False  # Flag to reset state when re-enabling
 
-        # Tray & Editor UI References
         self._tray = None
         self._editor_win = None
         self._live_label_var = tk.StringVar(value="Sensor Reading: Waiting...")
 
         self._build_tray()
         
-        # Start main loop & period polling
         self.root.after(1000, self.poll_sensor)
         self.root.mainloop()
 
-    # ── Sensor Interpolation Logic ────────────────────────────────────────────
+    def detect_system_wake(self):
+        """Detect if system just woke from sleep by checking for large time gaps."""
+        current_time = time.time()
+        time_gap = current_time - self.last_poll_time
+        self.last_poll_time = current_time
+        
+        # If gap > 5 seconds (normal poll is 2s), system likely woke
+        if time_gap > 5.0:
+            return True
+        return False
+
+    def full_reset_on_wake(self):
+        """Comprehensive reset: clear sensor, rebuild overlays, reset state on Windows wake/login."""
+        print("[Info] System wake detected — performing full reset...")
+        
+        # Clear all sensor state
+        self.sensor = None
+        self.sensor_was_disconnected = True
+        self.last_successful_reading_time = time.time()
+        
+        # Force overlay rebuild
+        self.overlay_mgr.rebuild()
+        self.overlay_mgr.set_overlay_alpha(0.0)
+        
+        # Reset brightness targets
+        self.last_hw = -1
+        self.last_ov = -1.0
+        
+        self.wake_detected = False
+        self.send_notification("AmbientDim Active", "Restarted after Windows login/wake.")
+
+    def get_current_hardware_brightness(self):
+        """Fetch actual hardware brightness percentage from Windows in real-time."""
+        cmd = "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness).CurrentBrightness"
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            val = res.stdout.strip()
+            if val.isdigit():
+                return int(val)
+        except Exception:
+            pass
+        return None
+
     def calculate_targets(self, lux: float):
         """Interpolate target Hardware Brightness and Overlay Alpha from ALR_CURVE."""
         curve = sorted(self.config.get("alr_curve", []), key=lambda x: x[0])
@@ -258,47 +328,95 @@ class AutoDimmerApp:
         return curve[-1][1], curve[-1][2]
 
     def update_tray_icon(self):
-        """Redraw the tray icon based on current enabled state and lux level."""
+        """Redraw tray icon based on enabled state and current lux."""
         if self._tray:
             self._tray.icon = make_tray_icon(self.config.get("enabled", True), self.current_lux)
 
     def poll_sensor(self):
-        """Periodically poll ALS and adjust screen brightness/overlay."""
+        """Periodically poll ALS, perform real-time HW sync, and adjust brightness/overlay."""
+        current_time = time.time()
+        
+        # Handle re-enable after toggle-off (prevent frozen state)
+        if self.force_reset_on_enable:
+            print("[Info] Re-enabling — resetting sensor and overlays...")
+            self.sensor = None
+            self.sensor_was_disconnected = True
+            self.overlay_mgr.rebuild()
+            self.last_hw = -1
+            self.last_ov = -1.0
+            self.last_successful_reading_time = current_time
+            self.force_reset_on_enable = False
+        
+        # Detect system wake and perform full reset
+        if self.detect_system_wake():
+            self.wake_detected = True
+        
+        if self.wake_detected:
+            self.full_reset_on_wake()
+        
+        # Auto-reconnect sensor if it was previously None or got stuck during sleep/startup
+        if self.sensor is None:
+            self.sensor = LightSensor.get_default()
+            if self.sensor is not None:
+                self.sensor.report_interval = self.config.get("poll_interval_ms", 2000)
+                self.sensor_was_disconnected = True
+                print("[Info] Sensor reconnected after sleep/disconnect")
+
         if self.config.get("enabled", True) and self.sensor:
-            reading = self.sensor.get_current_reading()
-            if reading:
-                self.current_lux = reading.illuminance_in_lux
-                hw_target, ov_target = self.calculate_targets(self.current_lux)
+            try:
+                reading = self.sensor.get_current_reading()
+                if reading:
+                    self.current_lux = reading.illuminance_in_lux
+                    self.last_successful_reading_time = current_time
+                    hw_target, ov_target = self.calculate_targets(self.current_lux)
 
-                # Update live editor UI label if editor window is open
-                self._live_label_var.set(
-                    f"Current Lux: {self.current_lux:.1f} Lux  │  Target HW: {hw_target}%  │  Overlay: {ov_target:.2f}"
-                )
+                    # Real-Time HW Sync: detect if user changed brightness manually
+                    actual_hw = self.get_current_hardware_brightness()
+                    if actual_hw is not None:
+                        if abs(actual_hw - self.last_hw) > 5:
+                            self.last_hw = actual_hw
 
-                # Dead band check to prevent flickering
-                dead_hw = self.config.get("dead_band_hw", 3)
-                dead_ov = self.config.get("dead_band_ov", 0.02)
+                    self._live_label_var.set(
+                        f"Current Lux: {self.current_lux:.1f} Lux  │  Target HW: {hw_target}%  │  Overlay: {ov_target:.2f}"
+                    )
 
-                hw_changed = abs(hw_target - self.last_hw) >= dead_hw
-                ov_changed = abs(ov_target - self.last_ov) >= dead_ov
+                    dead_hw = self.config.get("dead_band_hw", 3)
+                    dead_ov = self.config.get("dead_band_ov", 0.02)
 
-                if hw_changed:
-                    set_hardware_brightness(hw_target)
-                    self.last_hw = hw_target
+                    hw_changed = abs(hw_target - self.last_hw) >= dead_hw
+                    ov_changed = abs(ov_target - self.last_ov) >= dead_ov
 
-                if ov_changed:
-                    self.overlay_mgr.set_overlay_alpha(ov_target)
-                    self.last_ov = ov_target
+                    if hw_changed:
+                        set_hardware_brightness(hw_target)
+                        self.last_hw = hw_target
 
-                # Update Tray Icon Graphic and Tooltip
-                self.update_tray_icon()
-                if self._tray:
-                    self._tray.title = f"AutoDimmer — {self.current_lux:.1f} Lux (HW: {self.last_hw}%, OV: {self.last_ov:.2f})"
+                    if ov_changed:
+                        self.overlay_mgr.set_overlay_alpha(ov_target)
+                        self.last_ov = ov_target
+
+                    self.update_tray_icon()
+                    if self._tray:
+                        self._tray.title = f"AmbientDim — {self.current_lux:.1f} Lux (HW: {self.last_hw}%, OV: {self.last_ov:.2f})"
+                    
+                    # Trigger monitor rebuild if sensor just reconnected (Windows wake event)
+                    if self.sensor_was_disconnected:
+                        print("[Info] Rebuilding overlays after wake...")
+                        self.overlay_mgr.rebuild()
+                        self.sensor_was_disconnected = False
+                        
+            except Exception:
+                # If sensor reading throws an exception (e.g. device context lost), invalidate it to retry next cycle
+                self.sensor = None
+                self.sensor_was_disconnected = True
+        
+        # Detect stale readings (system in sleep > 30 seconds) and trigger reconnect
+        if self.sensor is not None and (current_time - self.last_successful_reading_time) > 30:
+            self.sensor = None
+            self.sensor_was_disconnected = True
 
         poll_rate = self.config.get("poll_interval_ms", 2000)
         self.root.after(poll_rate, self.poll_sensor)
 
-    # ── Notification Helper ───────────────────────────────────────────────────
     def send_notification(self, title, message):
         """Send Windows toast notifications via pystray."""
         if self.config.get("notifications_enabled", True) and self._tray:
@@ -307,22 +425,18 @@ class AutoDimmerApp:
             except Exception:
                 pass
 
-    # ── System Tray Setup ─────────────────────────────────────────────────────
     def _build_tray(self):
         def toggle_enabled(icon, item):
             self.config["enabled"] = not self.config["enabled"]
             save_config(self.config)
-            
-            # Immediately update icon graphic
             self.update_tray_icon()
             
             if not self.config["enabled"]:
-                # Restore full screen when disabled
-                set_hardware_brightness(100)
                 self.overlay_mgr.set_overlay_alpha(0.0)
-                self.send_notification("AutoDimmer Disabled", "Restored default screen state.")
+                self.send_notification("AmbientDim Disabled", "Dark overlay turned off.")
             else:
-                self.send_notification("AutoDimmer Enabled", "ALS Automation active.")
+                self.force_reset_on_enable = True  # Force clean state on re-enable
+                self.send_notification("AmbientDim Enabled", "ALS Automation active.")
 
         def toggle_autostart(icon, item):
             self.config["autostart"] = not self.config["autostart"]
@@ -338,17 +452,17 @@ class AutoDimmerApp:
 
         def refresh_monitors(icon, item):
             self.root.after(0, self.overlay_mgr.rebuild)
+            self.send_notification("Monitors Refreshed", "Overlay windows rebuilt.")
 
         def quit_app(icon, item):
-            # Restore full screen before exiting
+            # Clear overlays and exit cleanly without forcing 100% hardware brightness jump
             self.overlay_mgr.set_overlay_alpha(0.0)
-            set_hardware_brightness(100)
             if self._tray:
                 self._tray.stop()
             self.root.after(0, self.root.quit)
 
         menu = pystray.Menu(
-            pystray.MenuItem("Auto ALS Dimmer", toggle_enabled,
+            pystray.MenuItem("AmbientDim", toggle_enabled,
                              checked=lambda item: self.config.get("enabled", True)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("⚙ Calibrate ALS Curve...", open_editor),
@@ -357,18 +471,18 @@ class AutoDimmerApp:
                              checked=lambda item: self.config.get("autostart", False)),
             pystray.MenuItem("Show Notifications", toggle_notifications,
                              checked=lambda item: self.config.get("notifications_enabled", True)),
-            pystray.MenuItem("Refresh Monitors", refresh_monitors),
+            pystray.MenuItem("🔄 Refresh Monitors", refresh_monitors),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app)
         )
 
         initial_enabled = self.config.get("enabled", True)
-        self._tray = pystray.Icon("AutoDimmer", make_tray_icon(initial_enabled, self.current_lux), "AutoDimmer ALS", menu)
+        self._tray = pystray.Icon("AutoDimmer", make_tray_icon(initial_enabled, self.current_lux), "AmbientDim", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
     # ── ALS Curve Editor GUI ──────────────────────────────────────────────────
     def open_curve_editor(self):
-        """Open the interactive ALS Calibration Curve Editor."""
+        """Open the interactive ALS Calibration Curve Editor with dynamic scrollbar and responsive table."""
         if self._editor_win and tk.Toplevel.winfo_exists(self._editor_win):
             self._editor_win.lift()
             self._editor_win.focus_force()
@@ -376,30 +490,65 @@ class AutoDimmerApp:
 
         win = tk.Toplevel(self.root)
         self._editor_win = win
-        win.title("ALS Curve Calibration — AutoDimmer")
-        
-        # Dimensi jendela diperbesar agar muat dengan font 11/12
-        win.geometry("720x660")
-        win.resizable(False, False)
+        win.title("ALS Curve Calibration — AmbientDim")
+        win.geometry("750x660")
+        win.minsize(680, 480)
+        win.resizable(True, True)
         win.configure(bg="#1e1e1e")
-        win.attributes("-topmost", True)
 
         fg, bg, bg2, accent = "#f0f0f0", "#1e1e1e", "#2d2d2d", "#F5C518"
 
-        # Judul Utama (Font 16) & Subtitle (Font 11)
-        tk.Label(win, text="ALS Calibration Curve", font=("Segoe UI", 16, "bold"),
-                 bg=bg, fg=accent).pack(pady=(22, 2))
-        tk.Label(win, text="Map Lux sensor readings to screen hardware & dark overlay levels.",
-                 font=("Segoe UI", 11), bg=bg, fg="#aaaaaa").pack(pady=(0, 14))
+        top_frame = tk.Frame(win, bg=bg)
+        top_frame.pack(fill="x", padx=30, pady=(22, 10))
 
-        # Live Sensor Status Bar (Font 11 bold)
-        live_frame = tk.Frame(win, bg=bg2, highlightbackground="#444", highlightthickness=1)
-        live_frame.pack(fill="x", padx=30, pady=(0, 18))
+        tk.Label(top_frame, text="ALS Calibration Curve", font=("Segoe UI", 16, "bold"),
+                 bg=bg, fg=accent).pack(anchor="w")
+        tk.Label(top_frame, text="Map Lux sensor readings to screen hardware & dark overlay levels.",
+                 font=("Segoe UI", 11), bg=bg, fg="#aaaaaa").pack(anchor="w", pady=(2, 12))
+
+        live_frame = tk.Frame(top_frame, bg=bg2, highlightbackground="#444", highlightthickness=1)
+        live_frame.pack(fill="x")
         tk.Label(live_frame, textvariable=self._live_label_var, font=("Segoe UI", 11, "bold"),
                  bg=bg2, fg="#00FFCC", pady=10).pack()
 
-        table_frame = tk.Frame(win, bg=bg)
-        table_frame.pack(fill="both", expand=True, padx=30)
+        btn_frame = tk.Frame(win, bg=bg)
+        btn_frame.pack(side="bottom", fill="x", pady=20, padx=30)
+
+        middle_frame = tk.Frame(win, bg=bg)
+        middle_frame.pack(side="top", fill="both", expand=True, padx=30, pady=5)
+
+        canvas = tk.Canvas(middle_frame, bg=bg, highlightthickness=0)
+        scrollbar = tk.Scrollbar(middle_frame, orient="vertical", command=canvas.yview)
+        table_frame = tk.Frame(canvas, bg=bg)
+
+        canvas_window = canvas.create_window((0, 0), window=table_frame, anchor="nw")
+
+        def update_scrollbar_visibility(event=None):
+            canvas.update_idletasks()
+            c_height = canvas.winfo_height()
+            t_height = table_frame.winfo_reqheight()
+            
+            if c_height > 1:
+                if t_height > c_height:
+                    scrollbar.pack(side="right", fill="y")
+                else:
+                    scrollbar.pack_forget()
+
+        table_frame.bind(
+            "<Configure>", 
+            lambda e: (canvas.configure(scrollregion=canvas.bbox("all")), update_scrollbar_visibility())
+        )
+        canvas.bind(
+            "<Configure>", 
+            lambda e: (canvas.itemconfig(canvas_window, width=e.width), update_scrollbar_visibility())
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.pack(side="left", fill="both", expand=True)
 
         schedules = [list(pt) for pt in self.config.get("alr_curve", [])]
         rows = []
@@ -409,15 +558,14 @@ class AutoDimmerApp:
                 w.destroy()
             rows.clear()
 
-            # Header Tabel (Font 11 Bold)
             headers = ["Lux Level", "Hardware (%)", "Dark Overlay (0-0.9)", ""]
             col_widths = [16, 20, 22, 4]
             
             for col, (label, w) in enumerate(zip(headers, col_widths)):
+                table_frame.grid_columnconfigure(col, weight=1)
                 tk.Label(table_frame, text=label, bg=bg, fg="#aaaaaa",
-                         font=("Segoe UI", 11, "bold")).grid(row=0, column=col, padx=8, pady=(0, 10), sticky="w")
+                         font=("Segoe UI", 11, "bold")).grid(row=0, column=col, padx=8, pady=(0, 10), sticky="ew")
 
-            # Input Baris Tabel (Font 11)
             for i, pt in enumerate(schedules):
                 lux_var = tk.StringVar(value=str(pt[0]))
                 hw_var  = tk.StringVar(value=str(pt[1]))
@@ -426,17 +574,18 @@ class AutoDimmerApp:
                 for col, (var, w) in enumerate(zip([lux_var, hw_var, ov_var], [16, 20, 22])):
                     tk.Entry(table_frame, textvariable=var, width=w, bg=bg2, fg=fg,
                              insertbackground=fg, relief="flat", font=("Segoe UI", 11),
-                             justify="center").grid(row=i+1, column=col, padx=8, pady=4, ipady=5)
+                             justify="center").grid(row=i+1, column=col, padx=8, pady=5, ipady=6, sticky="ew")
 
                 def del_row(idx=i):
                     schedules.pop(idx)
                     render_rows()
 
-                # Tombol Hapus Row
                 tk.Button(table_frame, text="✕", command=del_row, bg="#c0392b", fg="white",
-                          relief="flat", font=("Segoe UI", 10, "bold"), padx=8, pady=2).grid(row=i+1, column=3, padx=4)
+                          relief="flat", font=("Segoe UI", 10, "bold"), padx=8, pady=3).grid(row=i+1, column=3, padx=4)
 
                 rows.append((lux_var, hw_var, ov_var))
+
+            update_scrollbar_visibility()
 
         render_rows()
 
@@ -468,19 +617,24 @@ class AutoDimmerApp:
             schedules.extend([list(pt) for pt in sorted_curve])
 
             self.send_notification("Curve Saved", f"Applied {len(sorted_curve)} calibration points.")
-            
-            render_rows()
+            win.destroy()
 
-        # Tombol Aksi Bawah (Font 11)
-        btn_frame = tk.Frame(win, bg=bg)
-        btn_frame.pack(pady=16)
+        def on_close():
+            canvas.unbind_all("<MouseWheel>")
+            win.destroy()
 
-        tk.Button(btn_frame, text="+ Add Point", command=add_point, bg=bg2, fg=fg,
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        btn_container = tk.Frame(btn_frame, bg=bg)
+        btn_container.pack()
+
+        tk.Button(btn_container, text="+ Add Point", command=add_point, bg=bg2, fg=fg,
                   relief="flat", font=("Segoe UI", 11), padx=14, pady=6).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="Reset Default", command=reset_defaults, bg="#444444", fg=fg,
+        tk.Button(btn_container, text="Reset Default", command=reset_defaults, bg="#444444", fg=fg,
                   relief="flat", font=("Segoe UI", 11), padx=14, pady=6).pack(side="left", padx=6)
-        tk.Button(btn_frame, text="Save Curve", command=save, bg=accent, fg="#111111",
+        tk.Button(btn_container, text="Save Curve", command=save, bg=accent, fg="#111111",
                   relief="flat", font=("Segoe UI", 11, "bold"), padx=22, pady=6).pack(side="left", padx=10)
 
 if __name__ == "__main__":
+    ensure_single_instance()
     AutoDimmerApp()
